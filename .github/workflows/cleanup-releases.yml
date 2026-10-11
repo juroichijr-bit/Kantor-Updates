@@ -1,0 +1,127 @@
+name: Keep only latest complete Kantor release
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: kantor-release-cleanup
+  cancel-in-progress: false
+jobs:
+  cleanup:
+    if: github.repository == 'juroichijr-bit/Kantor-Updates'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Preserve current modules and remove superseded releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, json, re, hashlib, urllib.request, urllib.parse
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          base = "https://api.github.com/repos/" + repo
+          prefix = "https://github.com/" + repo + "/releases/download/"
+          def api(path, method="GET", data=None, content_type="application/json"):
+              url = path if path.startswith("https://uploads.github.com/") else base + path
+              headers = {"Authorization": "Bearer " + token, "Accept": "application/vnd.github+json",
+                         "X-GitHub-Api-Version": "2022-11-28", "Content-Type": content_type}
+              if data is not None and not isinstance(data, bytes):
+                  data = json.dumps(data).encode()
+              with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers, method=method), timeout=180) as r:
+                  raw = r.read()
+              return json.loads(raw) if raw else None
+          def download(url):
+              # Public downloads deliberately carry no API credentials through redirects.
+              with urllib.request.urlopen(url, timeout=180) as r:
+                  return r.read()
+          def version(tag):
+              if not re.fullmatch(r"v[0-9]+(?:\.[0-9]+)*", tag):
+                  raise ValueError("Unsupported release tag: " + tag)
+              return tuple(map(int, tag[1:].split("."))) + (0,) * (8-len(tag[1:].split(".")))
+          latest = api("/releases/latest")
+          if latest["draft"] or latest["prerelease"] or latest.get("immutable"):
+              raise ValueError("Latest release must be a mutable stable release")
+          event = json.load(open(os.environ["GITHUB_EVENT_PATH"]))
+          if os.environ["GITHUB_EVENT_NAME"] == "release" and event["release"]["id"] != latest["id"]:
+              raise ValueError("Published release is not the current latest release")
+          rid = latest["id"]
+          assets = {a["name"]: a for a in api(f"/releases/{rid}/assets?per_page=100")}
+          apk = [a for n,a in assets.items() if re.fullmatch(r"Kantor-v[0-9.]+\.apk", n)]
+          if len(apk) != 1 or "catalog.json" not in assets or "modules.json" not in assets:
+              raise ValueError("Incomplete release: Kantor APK, catalog.json and modules.json required")
+          def checked_asset(a):
+              raw = download(a["browser_download_url"])
+              if len(raw) != a["size"] or a.get("digest") != "sha256:" + hashlib.sha256(raw).hexdigest():
+                  raise ValueError("Asset integrity failure: " + a["name"])
+              return raw
+          checked_asset(apk[0])
+          docs = {name: json.loads(checked_asset(assets[name])) for name in ("modules.json", "catalog.json")}
+          if not isinstance(docs["modules.json"], dict) or not isinstance(docs["catalog.json"], list):
+              raise ValueError("Invalid module/catalog format")
+          new_prefix = prefix + urllib.parse.quote(latest["tag_name"], safe="") + "/"
+          def upload(name, raw, kind):
+              url = latest["upload_url"].split("{")[0] + "?name=" + urllib.parse.quote(name, safe="")
+              return api(url, "POST", raw, kind)
+          def migrate(node):
+              if isinstance(node, dict):
+                  if "package" in node:
+                      if not node.get("url", "").startswith(prefix) or not re.fullmatch(r"[a-f0-9]{64}", node.get("sha256", "")):
+                          raise ValueError("Module URL/hash invalid")
+                      raw = download(node["url"])
+                      if len(raw) != node.get("size") or hashlib.sha256(raw).hexdigest() != node["sha256"]:
+                          raise ValueError("Module verification failed")
+                      name = urllib.parse.unquote(node["url"].rsplit("/",1)[1])
+                      if not re.fullmatch(r"[A-Za-z0-9_.-]+\.apk", name):
+                          raise ValueError("Invalid module filename")
+                      if name in assets:
+                          if checked_asset(assets[name]) != raw:
+                              raise ValueError("Conflicting module asset: " + name)
+                      else:
+                          assets[name] = upload(name, raw, "application/vnd.android.package-archive")
+                          checked_asset(assets[name])
+                      node["url"] = new_prefix + name
+                      print("Module ready:", name)
+                  for value in node.values():
+                      migrate(value)
+              elif isinstance(node, list):
+                  for value in node:
+                      migrate(value)
+          migrate(docs["modules.json"])
+          # Validate all repository release references before deleting anything.
+          def references(node):
+              if isinstance(node, str) and node.startswith(prefix) and not node.startswith(new_prefix):
+                  raise ValueError("Remaining dependency on an older release")
+              if isinstance(node, dict):
+                  for value in node.values(): references(value)
+              if isinstance(node, list):
+                  for value in node: references(value)
+          for doc in docs.values(): references(doc)
+          for name, doc in docs.items():
+              raw = (json.dumps(doc, separators=(",",":")) + "\n").encode()
+              if json.loads(checked_asset(assets[name])) != doc:
+                  # APK assets are already present; metadata is replaced only after validation.
+                  api(f'/releases/assets/{assets[name]["id"]}', "DELETE")
+                  assets[name] = upload(name, raw, "application/json")
+              if json.loads(checked_asset(assets[name])) != doc:
+                  raise ValueError("Published metadata mismatch")
+          all_releases = []
+          page = 1
+          while True:
+              batch = api(f"/releases?per_page=100&page={page}")
+              all_releases += batch
+              if len(batch) < 100: break
+              page += 1
+          for old in all_releases:
+              if old["id"] == rid or old["draft"] or old["prerelease"]: continue
+              if not re.fullmatch(r"v[0-9]+(?:\.[0-9]+)*", old["tag_name"]): continue
+              if version(old["tag_name"]) >= version(latest["tag_name"]): continue
+              if api("/releases/latest")["id"] != rid:
+                  raise ValueError("Latest release changed; cleanup stopped")
+              api(f'/releases/{old["id"]}', "DELETE")
+              print("Deleted superseded release:", old["tag_name"])
+          print("Cleanup completed. Latest release:", latest["tag_name"])
+          PY
